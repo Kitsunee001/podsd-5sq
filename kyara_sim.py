@@ -29,7 +29,7 @@ NIGHT_CONTINUE_CHANCE = 0.05  # on 5% of nights it doesn't stop
 MAX_RUN_HOURS = float(os.environ.get("MAX_RUN_HOURS", "0"))
 
 OPEN_URL = "https://kyara.games/api/packs/all/open"
-OPEN_BODY = {}  # JSON sent with the request; match the browser (Network tab -> Payload)
+OPEN_BODY = {"maxChakra": 0}  # JSON sent with the request (copied from the browser)
 MAX_FAILURES = 3  # stop after this many failed openings in a row
 
 # The token and device id come from environment variables (GitHub secrets),
@@ -89,7 +89,10 @@ def open_all_packs():
     if KYARA_DEVICE_ID:
         headers["x-device-id"] = KYARA_DEVICE_ID
     request = urllib.request.Request(
-        OPEN_URL, data=json.dumps(OPEN_BODY).encode(), headers=headers, method="POST"
+        OPEN_URL,
+        data=json.dumps(OPEN_BODY, separators=(",", ":")).encode(),  # compact, like the browser
+        headers=headers,
+        method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
