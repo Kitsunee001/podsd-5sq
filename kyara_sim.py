@@ -41,6 +41,12 @@ KYARA_DEVICE_ID = os.environ.get("KYARA_DEVICE_ID", "").strip()
 LIVE = bool(KYARA_TOKEN)  # no token = simulation only, nothing is sent
 TEST_OPEN_NOW = os.environ.get("TEST_OPEN_NOW") == "1"  # one real request, then stop
 
+# Push notifications through ntfy. On the public server the topic name is the only
+# protection (anyone who knows it can read it), so it is a secret too. No topic = no alerts.
+NTFY_SERVER = "https://ntfy.sh"
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip().rstrip("/").rsplit("/", 1)[-1]
+ALERT_RARITY = "mythic"  # a pull of this rarity sends a notification
+
 
 def local_now():
     return datetime.fromtimestamp(time.time(), LOCAL_TZ)
@@ -74,7 +80,7 @@ def next_resume(now):
 
 
 def open_all_packs():
-    """Send the open-all request. Returns the HTTP status, or 0 if nothing came back."""
+    """Send the open-all request. Returns (HTTP status or 0, response as parsed JSON or None)."""
     headers = {
         "accept": "*/*",
         "content-type": "application/json",
@@ -87,12 +93,82 @@ def open_all_packs():
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            response.read()  # the body is never logged: Actions logs are public in a public repo
-            return response.status
+            status, raw = response.status, response.read()
     except urllib.error.HTTPError as error:
-        return error.code
+        return error.code, None
     except OSError:  # no connection, timeout, DNS error...
-        return 0
+        return 0, None
+    try:
+        return status, json.loads(raw)
+    except ValueError:
+        return status, None  # not JSON; the body is never logged (Actions logs are public)
+
+
+def notify(title, message, priority="high", tags="tada"):
+    """Push a notification through ntfy. Returns True if sent. Never raises."""
+    if not NTFY_TOPIC:
+        return False
+    request = urllib.request.Request(
+        f"{NTFY_SERVER}/{NTFY_TOPIC}",
+        data=message[:1000].encode("utf-8"),
+        headers={"Title": title, "Priority": priority, "Tags": tags},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return True
+    except Exception as error:  # a failed notification must never stop the script
+        # Only the error type: the full text can contain the URL, and the topic is secret.
+        log(f"ntfy notification failed ({getattr(error, 'code', type(error).__name__)})")
+        return False
+
+
+def card_name(card):
+    """Best guess at a card's name; also looks one level down, e.g. {"card": {...}}."""
+    for source in [card] + [v for v in card.values() if isinstance(v, dict)]:
+        for key in ("name", "title", "cardName", "card_name"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip().lower() != ALERT_RARITY:
+                return value.strip()
+    return None
+
+
+def find_alerts(data):
+    """One entry (the card's name, or None) for every object in the response that
+    has ALERT_RARITY as one of its values, e.g. {"name": "...", "rarity": "mythic"}."""
+    found = []
+    if isinstance(data, dict):
+        if any(isinstance(v, str) and v.strip().lower() == ALERT_RARITY for v in data.values()):
+            found.append(card_name(data))
+        for value in data.values():
+            found += find_alerts(value)
+    elif isinstance(data, list):
+        for item in data:
+            found += find_alerts(item)
+    return found
+
+
+def shape(data):
+    """Keys and types only, no values, so it is safe to print (test run only)."""
+    if isinstance(data, dict):
+        return {key: shape(value) for key, value in list(data.items())[:15]}
+    if isinstance(data, list):
+        return [shape(data[0])] if data else []
+    return type(data).__name__
+
+
+def rarities_seen(data, seen=None):
+    """Values of every field with 'rarity' in its name (test run only)."""
+    seen = set() if seen is None else seen
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if "rarity" in key.lower() and isinstance(value, (str, int)):
+                seen.add(str(value))
+            rarities_seen(value, seen)
+    elif isinstance(data, list):
+        for item in data:
+            rarities_seen(item, seen)
+    return seen
 
 
 packs = 0
@@ -112,8 +188,16 @@ if TEST_OPEN_NOW:
     if not LIVE:
         log("Test: no KYARA_TOKEN set, nothing to send")
         raise SystemExit(1)
-    status = open_all_packs()
+    status, data = open_all_packs()
     log(f"Test: open request returned HTTP {status or 'no response'}")
+    if data is not None:
+        log(f"Test: response shape (keys and types only): {json.dumps(shape(data))[:800]}")
+        log(f"Test: rarity values in the response: {str(sorted(rarities_seen(data)))[:300]}")
+        log(f"Test: {len(find_alerts(data))} {ALERT_RARITY} found in the response")
+    if not NTFY_TOPIC:
+        log("Test: NTFY_TOPIC is not set, no notification sent")
+    elif notify("Kyara test", "ntfy is working", priority="default", tags="white_check_mark"):
+        log("Test: notification sent, check your phone")
     raise SystemExit(0 if 200 <= status < 300 else 1)
 
 while True:
@@ -167,11 +251,17 @@ while True:
             )
             packs = 0
         else:
-            status = open_all_packs()
+            status, data = open_all_packs()
             if 200 <= status < 300:
                 failures = 0
                 packs = 0
                 log(f"Opened packs (HTTP {status}); next opening in {wait / 60:.0f} min")
+                alerts = find_alerts(data)
+                if alerts:
+                    names = ", ".join(name for name in alerts if name)
+                    text = f"Pulled {len(alerts)} {ALERT_RARITY}" + (f": {names}" if names else "")
+                    log(text)
+                    notify(f"Kyara: {ALERT_RARITY.title()}!", text)
             elif status in (401, 403):
                 log(f"Kyara refused the token (HTTP {status}), stopping")
                 raise SystemExit(1)
