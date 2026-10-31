@@ -29,6 +29,7 @@ jobs:
       TEST_OPEN_NOW: ${{ inputs.test_now && '1' || '0' }}
       KYARA_TOKEN: ${{ secrets.KYARA_TOKEN }}
       KYARA_DEVICE_ID: ${{ secrets.KYARA_DEVICE_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
     steps:
       - uses: actions/checkout@v6
       - run: python3 kyara_sim.py
