@@ -81,18 +81,24 @@ ALERT_COOLDOWN_S = 6 * 3600
 
 # Credentials and optional services come from environment variables (GitHub secrets or a
 # .env file), never from this file: in a public repo anyone could read them.
-KYARA_TOKEN = os.environ.get("KYARA_TOKEN", "").strip()
+def env_secret(name):
+    """A value from the environment without spaces or quotes around it."""
+    return os.environ.get(name, "").strip().strip("\"'").strip()
+
+
+KYARA_TOKEN = env_secret("KYARA_TOKEN")
 if KYARA_TOKEN.lower().startswith("bearer "):
     KYARA_TOKEN = KYARA_TOKEN[7:].strip()
-KYARA_DEVICE_ID = os.environ.get("KYARA_DEVICE_ID", "").strip()
+KYARA_DEVICE_ID = env_secret("KYARA_DEVICE_ID")
 LIVE = bool(KYARA_TOKEN)  # no token = simulation only, nothing is sent
 TEST_OPEN_NOW = os.environ.get("TEST_OPEN_NOW") == "1"  # one real check + one real opening, then stop
 
 NTFY_SERVER = "https://ntfy.sh"
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip().rstrip("/").rsplit("/", 1)[-1]
-HEALTHCHECK_URL = os.environ.get("HEALTHCHECK_URL", "").strip()  # optional dead-man's switch (healthchecks.io)
+NTFY_TOPIC = env_secret("NTFY_TOPIC").rstrip("/").rsplit("/", 1)[-1]
+HEALTHCHECK_URL = env_secret("HEALTHCHECK_URL")  # optional dead-man's switch (healthchecks.io)
 ALERT_RARITY = "mythic"  # a pull of this rarity sends a notification
 NOTIFY_EVERY_OPENING = False  # True = also send a quiet ntfy message after every opening
+SHOW_ERROR_HINTS = True  # when the site answers with an error, log its server, type and first 100 characters
 
 SECRETS = [s for s in (KYARA_TOKEN, KYARA_DEVICE_ID, NTFY_TOPIC, HEALTHCHECK_URL) if len(s) >= 4]
 
@@ -242,6 +248,31 @@ class SimGame:
 
 _sim = []
 _last_request = [0.0]
+_error_hint = [""]
+
+
+def describe_error(error):
+    """A short, safe description of an error answer (server, type, first characters) so the log
+    shows WHY a request failed. Successful answers are never logged."""
+    try:
+        headers = getattr(error, "headers", None)
+        parts = []
+        for name in ("Server", "Content-Type", "cf-mitigated"):
+            value = headers.get(name) if headers is not None else None
+            if value:
+                parts.append(f"{name.lower()}: {str(value)[:40]}")
+        body = error.read(200).decode("utf-8", "replace") if hasattr(error, "read") else ""
+        body = " ".join(body.split())[:100]
+        if body:
+            parts.append(f"body: {body!r}")
+        return "; ".join(parts)
+    except Exception:
+        return ""
+
+
+def take_hint():
+    hint, _error_hint[0] = _error_hint[0], ""
+    return f" - {hint}" if hint else ""
 
 
 def retry_after_seconds(headers):
@@ -253,7 +284,9 @@ def retry_after_seconds(headers):
 
 def request(method, url, body=None):
     """One request to the site. Returns (HTTP status or 0 if nothing came back, parsed JSON or None,
-    Retry-After seconds or None). Never raises; the body is never logged (Actions logs are public)."""
+    Retry-After seconds or None). Never raises; answers to successful requests are never logged
+    (Actions logs are public)."""
+    _error_hint[0] = ""
     gap = _last_request[0] + MIN_REQUEST_GAP_S - now()
     if gap > 0:
         time.sleep(gap)
@@ -277,6 +310,8 @@ def request(method, url, body=None):
     except urllib.error.HTTPError as error:
         status, raw = error.code, b""
         retry_after = retry_after_seconds(getattr(error, "headers", None))
+        if SHOW_ERROR_HINTS:
+            _error_hint[0] = describe_error(error)
     except Exception:  # no connection, timeout, DNS error, reset ...
         return 0, None, None
     try:
@@ -425,7 +460,7 @@ class Bot:
         status, data, retry_after = request("GET", ME_URL)
         kind = kind_of(status)
         if kind != "ok":
-            log(f"Could not read your packs (HTTP {status or 'no answer'})")
+            log(f"Could not read your packs (HTTP {status or 'no answer'}){take_hint()}")
             self.auth_blocked = kind == "auth"
             return kind, None, retry_after
         try:
@@ -539,6 +574,8 @@ class Bot:
         log(f"Opening {plural(me.packs)} ({why})")
         status, data, retry_after = request("POST", OPEN_URL, OPEN_BODY)
         kind = kind_of(status)
+        if kind != "ok":
+            log(f"The open request got HTTP {status or 'no answer'}{take_hint()}")
         if kind == "ok":
             if self.after_opening(me, data):
                 self.failures = 0
@@ -650,7 +687,7 @@ class Bot:
         ok = True
         if me.packs >= 1:
             status, data, _ = request("POST", OPEN_URL, OPEN_BODY)
-            log(f"Test: open request returned HTTP {status or 'no response'}")
+            log(f"Test: open request returned HTTP {status or 'no response'}{take_hint()}")
             ok = kind_of(status) == "ok"
             if data is not None:
                 log(f"Test: response shape (keys and types only): {json.dumps(shape(data))[:800]}")
