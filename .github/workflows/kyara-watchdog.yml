@@ -1,0 +1,39 @@
+name: kyara-watchdog
+
+# Every ~20 minutes: if the main loop is not running (or waiting to run), start it.
+# Scheduled runs on GitHub can be late or dropped, which is why there are three a hour.
+on:
+  schedule:
+    - cron: "7,27,47 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: kyara-watchdog
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+    steps:
+      - name: Restart the main loop if nothing is running
+        run: |
+          active=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow kyara-sim --limit 30 \
+            --json status --jq '[.[] | select(.status != "completed")] | length')
+          echo "Runs of kyara-sim that are running or waiting: $active"
+          if [ "$active" = "0" ]; then
+            gh workflow run kyara-sim --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+            echo "Main loop was not running: started it again"
+            if [ -n "$NTFY_TOPIC" ]; then
+              curl -s -o /dev/null -H "Title: Kyara watchdog" -H "Priority: high" -H "Tags: warning" \
+                -d "The main loop was not running, so the watchdog started it again." \
+                "https://ntfy.sh/$NTFY_TOPIC" || true
+            fi
+          fi
