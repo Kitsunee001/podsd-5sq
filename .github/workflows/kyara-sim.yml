@@ -1,0 +1,55 @@
+name: kyara-sim
+
+# The main loop. It runs for ~5.5 hours (GitHub kills any job at 6 hours), then its last
+# step starts the next run, so the script keeps going. If that hand-over ever fails, the
+# watchdog workflow (kyara-watchdog.yml) starts a new run within about 20-40 minutes.
+on:
+  workflow_dispatch:
+    inputs:
+      test_now:
+        description: "Test: check my packs, open once, send a test notification, then stop"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write   # lets the last step start the next run
+  contents: read
+
+concurrency:
+  # Only one loop at a time (no duplicate openings). Test runs get their own group so
+  # they don't wait behind the loop.
+  group: kyara-${{ inputs.test_now && 'test' || 'loop' }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350        # safety net; GitHub hard-stops jobs at 360
+    env:
+      MAX_RUN_HOURS: "5.5"      # the script hands over after 5h20m
+      GIVE_UP_AFTER_MIN: "60"   # no answer from the site for an hour -> exit, a fresh run takes over
+      TEST_OPEN_NOW: ${{ inputs.test_now && '1' || '0' }}
+      KYARA_TOKEN: ${{ secrets.KYARA_TOKEN }}
+      KYARA_DEVICE_ID: ${{ secrets.KYARA_DEVICE_ID }}
+      NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Remember when this run started
+        run: echo "RUN_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Run the script
+        run: python3 -u kyara_sim.py
+
+      - name: Start the next run right away
+        # Not when cancelled (that is how you stop it) and not after a test run.
+        if: ${{ !cancelled() && env.TEST_OPEN_NOW != '1' }}
+        run: |
+          elapsed=$(( $(date +%s) - RUN_STARTED ))
+          if [ "$elapsed" -ge 1800 ]; then
+            gh workflow run "$GITHUB_WORKFLOW" --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
+          else
+            echo "This run lasted only $((elapsed / 60)) min, so it is not restarted at once (the watchdog will try again later)"
+          fi
